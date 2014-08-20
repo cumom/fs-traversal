@@ -24,6 +24,11 @@ module.exports = function(sdk) {
     _visited: {},
 
     /**
+     * The list of persons we may want to visit later.
+     */
+    _held: {},
+
+    /**
      * The object of person id's we've fetched so far.
      * Note that we place these in here before calling the API.
      * It is possible that the API call failed, in which case we
@@ -42,7 +47,12 @@ module.exports = function(sdk) {
      * Our traversal options.
      */
     _options: {
-      limit: Infinity,
+      limit_count: 50000,
+      limit_depth: [-Infinity,Infinity],
+      limit_top: Infinity,
+      limit_distance: Infinity,
+      limit_down: Infinity,
+      limit_side: Infinity,
       order: 'wrd',
       wrdFactors: {
         gPositive: 1, // We allow different values for g >= 0 vs g < 0
@@ -62,7 +72,7 @@ module.exports = function(sdk) {
      * Expose functions to change options
      */
     order: function(type) {
-      if(type != 'wrd' && type != 'distance' && type != 'ancestry' && type != 'descendancy') {
+      if(type != 'wrd' && type != 'distance' && type != 'ancestry' && type != 'descendancy' && type != 'topdown') {
         throw new Error('invalid order');
       }
       // Make sure we haven't or are not currently traversing.
@@ -86,11 +96,29 @@ module.exports = function(sdk) {
     /**
      * Set a limit on the number of people to visit
      */
-    limit: function(num) {
-      if(typeof num !== 'number') {
-        throw new Error('invalid limit');
+    limit: function(arg) {
+      var self = this;
+      if(typeof arg === 'number') {
+        this._options.limit_count = arg;
+      } else {
+        if ('up' in arg)
+          this._options.limit_up = arg.up;
+        if ('side' in arg)
+          this._options.limit_side = arg.side;
+        if ('down' in arg)
+          this._options.limit_down = arg.down;
+        if (arg.count)
+          this._options.limit_count = arg.count;
       }
-      this._options.limit = num;
+      each(self._held, function(rel,personId){
+        // WARNING: Even though we filtered out already fetched people
+        // if filter was async we may have processed some in another "thread"
+        //console.log('ReVisit?',personId,rel);
+        if(!self._fetched[personId]) {
+          self._qNowOrLater(personId,rel);
+        }
+      });
+      
 
       return this;
     },
@@ -178,7 +206,7 @@ module.exports = function(sdk) {
         match = true;
         gender = undefined;
         lastPersonOffset = offset + ((switchStr.length-1)*2);
-        if(this._visited[path[lastPersonOffset]] && this._visited[path[lastPersonOffset]].getPrimaryPerson()) {
+        if(this._visited[path[lastPersonOffset]] && this._visited[path[lastPersonOffset]].getPrimaryPerson() && this._visited[path[lastPersonOffset]].getPrimaryPerson().gender) {
           gender = this._visited[path[lastPersonOffset]].getPrimaryPerson().gender.type;
         }
         rel = '';
@@ -406,7 +434,7 @@ module.exports = function(sdk) {
       if(arguments.length == 1) {
         self._traverse(arguments[0]);
       } else {
-        self._sdk.getCurrentUser().done(function(response){
+        self._sdk.getCurrentUser().then(function(response){
           self._traverse(response.getUser().personId);
         });
       }
@@ -436,6 +464,9 @@ module.exports = function(sdk) {
         type: 'root',
         depth: 0,
         distance: 0,
+        top: 0,
+        down: 0,
+        spouse: false,
         wrd: {
           g: 0,
           c: 0,
@@ -456,7 +487,7 @@ module.exports = function(sdk) {
           // will get called at the proper time.
           // TODO: move to before _processPerson and find better way of tracking "the end" of traversal
           callback();
-        }).fail(function(error){
+        },function(error){
           each(self._callbacks.error, function(cb){
             setTimeout(function(){
               cb.call(self, personId, error);
@@ -472,7 +503,7 @@ module.exports = function(sdk) {
         self._status = 'done';
         each(self._callbacks.done, function(cb){
           setTimeout(function(){ 
-            cb.call(self); 
+            cb.call(self, self._options); 
           });
         });
       };
@@ -494,6 +525,9 @@ module.exports = function(sdk) {
             type: 'child',
             depth: fetched.depth - 1,
             distance: fetched.distance + 1,
+            top: fetched.top,
+            down: fetched.down + 1,
+            spouse: fetched.spouse,
             wrd: {
               g: fetched.wrd.g - 1,
               c: (fetched.wrd.up) ? fetched.wrd.c + 1 : fetched.wrd.c,
@@ -502,6 +536,10 @@ module.exports = function(sdk) {
             },
             path: fetched.path.concat(['child', childId])
           };
+          if (fetched.spouse){
+            rels[childId].top = Infinity;
+            rels[childId].down = 0;
+          }
         }
       })
       
@@ -511,6 +549,9 @@ module.exports = function(sdk) {
             type: 'father',
             depth: fetched.depth + 1,
             distance: fetched.distance + 1,
+            top: fetched.top + 1,
+            down: fetched.down,
+            spouse: fetched.spouse,
             wrd: {
               g: fetched.wrd.g + 1,
               c: (fetched.wrd.c == 0) ? 0 : fetched.wrd.c + 1,
@@ -519,6 +560,10 @@ module.exports = function(sdk) {
             },
             path: fetched.path.concat(['father', fatherId])
           };
+          if (fetched.spouse){
+            rels[fatherId].top = Infinity;
+            rels[fatherId].down = 0;
+          }
         }
       });
       
@@ -528,6 +573,9 @@ module.exports = function(sdk) {
             type: 'mother',
             depth: fetched.depth + 1,
             distance: fetched.distance + 1,
+            top: fetched.top + 1,
+            down: fetched.down,
+            spouse: fetched.spouse,
             wrd: {
               g: fetched.wrd.g + 1,
               c: (fetched.wrd.c == 0) ? 0 : fetched.wrd.c + 1,
@@ -536,6 +584,10 @@ module.exports = function(sdk) {
             },
             path: fetched.path.concat(['mother', motherId])
           };
+          if (fetched.spouse){
+            rels[motherId].top = Infinity;
+            rels[motherId].down = 0;
+          }
         }
       });
       
@@ -545,6 +597,9 @@ module.exports = function(sdk) {
             type: 'marriage',
             depth: fetched.depth,
             distance: fetched.distance + 1,
+            top: fetched.top,
+            down: fetched.down,
+            spouse: true,
             wrd: {
               g: fetched.wrd.g,
               c: fetched.wrd.c,
@@ -553,6 +608,10 @@ module.exports = function(sdk) {
             },
             path: fetched.path.concat(['spouse', spouseId])
           };
+          if (fetched.spouse){
+            rels[spouseId].top = Infinity;
+            rels[spouseId].down = 0;
+          }
         }
       });
 
@@ -587,11 +646,7 @@ module.exports = function(sdk) {
         // WARNING: Even though we filtered out already fetched people
         // if filter was async we may have processed some in another "thread"
         if(!self._fetched[personId]) {
-          if(self._count < self._options.limit) {
-            self._count++;
-            self._fetched[personId] = rels[personId];
-            self._queue.push(personId, self._calcWeight(self._fetched[personId]));
-          }
+          self._qNowOrLater(personId,rels[personId]);
         }
       });
 
@@ -825,6 +880,31 @@ module.exports = function(sdk) {
 
     },
 
+    _qNowOrLater: function(personId, rel) {
+      var self = this;
+
+      if (self._count > self._options.limit_count){
+        //console.log('Too many people:',personId,rel)
+        self._held[personId] = rel;
+      } else if ( rel.down > 0 && (rel.type=='mother' || rel.type=='father') ) {
+        //console.log('No name for relation:',personId,rel)
+        self._held[personId] = rel;
+      } else if ( rel.depth < -self._options.limit_down || rel.depth > self._options.limit_up ) {
+        //console.log('Too high or low:',personId,rel)
+        self._held[personId] = rel;
+      } else if ( rel.down > 0  &&  rel.top > self._options.limit_side ){
+        //console.log('Too far:',personId,rel)
+        self._held[personId] = rel;
+      } else if (rel.spouse) {
+        //console.log('Ignore because spouse:',personId,rel)
+      } else {
+        //console.log('Queue',personId,rel,self._options)
+        self._count++;
+        self._fetched[personId] = rel;
+        self._queue.push(personId, self._calcWeight(self._fetched[personId]));
+      }
+    },
+
     /**
      * Calculates the weight for the node.
      */
@@ -845,6 +925,11 @@ module.exports = function(sdk) {
           return fetchObj.depth;
         case 'distance':
           return fetchObj.distance;
+        case 'topdown':
+          var score = (fetchObj.top<<8) + fetchObj.down
+          if (fetchObj.spouse)
+            score += (1<<16);
+          return score;
         default:
           return 0;
       }
@@ -2088,3 +2173,9 @@ process.chdir = function (dir) {
 },{}]},{},[1])
 (1)
 });
+
+Number.prototype.between  = function (arr, inclusive) {
+    var min = Math.min.apply(Math, [arr[0],arr[1]]),
+        max = Math.max.apply(Math, [arr[0],arr[1]]);
+    return inclusive ? this >= min && this <= max : this > min && this < max;
+};
